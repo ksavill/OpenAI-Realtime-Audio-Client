@@ -5,6 +5,7 @@ import json
 import base64
 import pyaudio
 import numpy as np
+import time
 
 OPENAI_API_KEY = os.getenv("openai_token")
 
@@ -93,7 +94,8 @@ def on_message(ws, message):
     elif event_type == 'response.audio_transcript.delta':
         text_chunk = event.get('delta')
         if text_chunk:
-            print(f"Audio transcript delta: {text_chunk}", end='', flush=True)
+            # print(f"Audio transcript delta: {text_chunk}", end='', flush=True)
+            pass
         else:
             print("Warning: 'response.audio_transcript.delta' event received without 'delta' field.")
 
@@ -169,32 +171,91 @@ def send_audio_stream(ws):
                     frames_per_buffer=CHUNK)
 
     print("Recording and sending audio. Press Ctrl+C to stop.")
-    buffer_active = False  # Flag to track if audio has been sent since last commit
+
+    buffer_active = False
+    last_audio_time = time.time()
+    THRESHOLD = 0.3
+    COMMIT_INTERVAL = 1
+    SILENCE_TIMEOUT = 2
+
     try:
         while True:
-            audio_frames = stream.read(CHUNK, exception_on_overflow=False)
-            audio_base64 = base64.b64encode(audio_frames).decode('utf-8')
+            try:
+                audio_frames = stream.read(CHUNK, exception_on_overflow=False)
+            except IOError as e:
+                print(f"IOError during stream.read(): {e}")
+                continue
 
-            # Send the audio chunk to the server
-            event = {
-                "type": "input_audio_buffer.append",
-                "audio": audio_base64
-            }
-            ws.send(json.dumps(event))
-            buffer_active = True  # Mark that audio has been sent
+            if not audio_frames:
+                print("Received empty audio frames.")
+                continue
 
-            # Commit the audio buffer periodically
-            send_audio_stream.counter += 1
-            if send_audio_stream.counter >= int(5 * RATE / CHUNK):
-                if buffer_active:
-                    commit_event = {"type": "input_audio_buffer.commit"}
-                    ws.send(json.dumps(commit_event))
-                    print("Committed audio buffer.")
-                    send_audio_stream.counter = 0
-                    buffer_active = False  # Reset buffer flag
-                else:
-                    # Buffer is empty; avoid committing
-                    send_audio_stream.counter = 0
+            expected_length = CHUNK * 2  # 2 bytes per int16 sample
+            if len(audio_frames) != expected_length:
+                print(f"Unexpected audio_frames length: {len(audio_frames)}, expected: {expected_length}")
+                continue
+
+            audio_data = np.frombuffer(audio_frames, dtype=np.int16)
+
+            if audio_data.size == 0:
+                print("No audio data received.")
+                continue
+
+            if np.all(audio_data == 0):
+                print("Audio data contains only zeros.")
+                continue
+
+            if np.isnan(audio_data).any():
+                print("NaN values detected in audio_data.")
+                continue
+
+            if np.isinf(audio_data).any():
+                print("Inf values detected in audio_data.")
+                continue
+
+            mean_square = np.mean(np.square(audio_data))
+
+            if np.isnan(mean_square) or np.isinf(mean_square):
+                print(f"Invalid mean_square value: {mean_square}")
+                continue
+
+            if mean_square < 0:
+                print(f"Negative mean_square value: {mean_square}")
+                continue
+
+            rms = np.sqrt(mean_square)
+
+            if np.isnan(rms) or np.isinf(rms):
+                print(f"Invalid RMS value: {rms}")
+                continue
+
+            # print(f"RMS: {rms}")
+
+            if rms > THRESHOLD:
+                audio_base64 = base64.b64encode(audio_frames).decode('utf-8')
+                event = {
+                    "type": "input_audio_buffer.append",
+                    "audio": audio_base64
+                }
+                ws.send(json.dumps(event))
+                buffer_active = True
+                last_audio_time = time.time()
+                print(f"Audio sent with RMS amplitude: {rms}")
+            else:
+                # print(f"Silence detected with RMS amplitude: {rms}")
+                pass
+
+            current_time = time.time()
+            if buffer_active and (current_time - last_audio_time >= COMMIT_INTERVAL):
+                commit_event = {"type": "input_audio_buffer.commit"}
+                ws.send(json.dumps(commit_event))
+                print("Committed audio buffer due to active audio.")
+                buffer_active = False
+            elif not buffer_active and (current_time - last_audio_time >= SILENCE_TIMEOUT):
+                commit_event = {"type": "input_audio_buffer.commit"}
+                ws.send(json.dumps(commit_event))
+                print("Committed audio buffer due to silence timeout.")
+                last_audio_time = current_time
 
     except KeyboardInterrupt:
         print("Stopping audio capture.")
